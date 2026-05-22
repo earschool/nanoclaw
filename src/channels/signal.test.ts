@@ -5,7 +5,16 @@ import * as os from 'node:os';
 
 // --- Mocks ---
 
-vi.mock('./channel-registry.js', () => ({ registerChannelAdapter: vi.fn() }));
+vi.mock('./channel-registry.js', () => ({
+  registerChannelAdapter: vi.fn(),
+  registerCompletionHook: vi.fn(),
+}));
+// Container-configs mock — signal.ts now imports getChannelSettings for the
+// completion-hook config gate. Default-on; tests that need readReceipts=false
+// can override per-test.
+vi.mock('../db/container-configs.js', () => ({
+  getChannelSettings: vi.fn(() => ({ signal: { readReceipts: true } })),
+}));
 vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../log.js', () => ({
   log: {
@@ -65,6 +74,7 @@ vi.mock('node:net', () => ({
 
 import type { ChannelSetup } from './adapter.js';
 import { createSignalAdapter } from './signal.js';
+import { log } from '../log.js';
 
 // --- Test helpers ---
 
@@ -1100,6 +1110,156 @@ describe('SignalAdapter', () => {
       await adapter.setTyping!('group:abc123', null);
 
       expect(getRpcCallsForMethod('sendTyping')).toHaveLength(0);
+
+      await adapter.teardown();
+    });
+  });
+
+  // --- Receipt envelope handling ---
+
+  describe('receipt envelope handling', () => {
+    it('logs an inbound read receipt and does not call onInbound', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        receiptMessage: {
+          type: 'read',
+          timestamps: [1234567890],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(log.debug).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          direction: 'inbound-receipt',
+          sender: '+15555550123',
+          type: 'read',
+          timestamps: [1234567890],
+        }),
+      );
+      expect(cfg.onInbound).not.toHaveBeenCalled();
+      expect(cfg.onMetadata).not.toHaveBeenCalled();
+
+      await adapter.teardown();
+    });
+
+    it('logs an inbound viewed receipt distinctly', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        receiptMessage: {
+          type: 'viewed',
+          timestamps: [1700000000000],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(log.debug).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          direction: 'inbound-receipt',
+          sender: '+15555550123',
+          type: 'viewed',
+          timestamps: [1700000000000],
+        }),
+      );
+      expect(cfg.onInbound).not.toHaveBeenCalled();
+
+      await adapter.teardown();
+    });
+
+    it('logs an inbound delivery receipt distinctly', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        receiptMessage: {
+          type: 'delivery',
+          timestamps: [1700000000001, 1700000000002],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(log.debug).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          direction: 'inbound-receipt',
+          sender: '+15555550123',
+          type: 'delivery',
+          timestamps: [1700000000001, 1700000000002],
+        }),
+      );
+      expect(cfg.onInbound).not.toHaveBeenCalled();
+
+      await adapter.teardown();
+    });
+
+    it('regression: dataMessage envelope still flows through to onInbound', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000000000,
+          message: 'Hello after receipts branch',
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(cfg.onInbound).toHaveBeenCalledTimes(1);
+      expect(cfg.onInbound).toHaveBeenCalledWith(
+        '+15555550123',
+        null,
+        expect.objectContaining({
+          id: '1700000000000',
+          content: expect.objectContaining({ text: 'Hello after receipts branch' }),
+        }),
+      );
+
+      await adapter.teardown();
+    });
+
+    it('regression: editMessage envelope is not treated as a receipt and yields no inbound emission', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        editMessage: {
+          targetSentTimestamp: 1700000000000,
+          dataMessage: {
+            timestamp: 1700000000123,
+            message: 'edited text',
+          },
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(cfg.onInbound).not.toHaveBeenCalled();
+      // And we did not log it as an inbound receipt either.
+      const receiptLogs = (log.debug as unknown as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (c) => c[1] && typeof c[1] === 'object' && (c[1] as any).direction === 'inbound-receipt',
+      );
+      expect(receiptLogs).toHaveLength(0);
 
       await adapter.teardown();
     });

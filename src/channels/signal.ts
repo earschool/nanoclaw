@@ -14,7 +14,8 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
-import { registerChannelAdapter } from './channel-registry.js';
+import { registerChannelAdapter, registerCompletionHook } from './channel-registry.js';
+import { getChannelSettings } from '../db/container-configs.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 
@@ -406,12 +407,18 @@ interface SignalDataMessage {
   }>;
 }
 
+interface SignalReceiptMessage {
+  type?: 'read' | 'viewed' | 'delivery' | string;
+  timestamps?: number[];
+}
+
 interface SignalEnvelope {
   source?: string;
   sourceName?: string;
   sourceNumber?: string;
   sourceUuid?: string;
   dataMessage?: SignalDataMessage;
+  receiptMessage?: SignalReceiptMessage;
   syncMessage?: {
     sentMessage?: SignalDataMessage & {
       destination?: string;
@@ -678,6 +685,115 @@ export function createSignalAdapter(config: {
   const echoCache = new EchoCache();
   let setup: ChannelSetup | null = null;
 
+  // Cached at adapter start() via the `version` RPC. Gates outbound read
+  // receipts: false → completion hook returns early. May flip from true to
+  // false later if a `sendReceipt` RPC fails with method-not-found shape.
+  // SIGNAL_FORCE_RECEIPTS_DISABLED=1 forces this to stay false regardless
+  // of detected daemon version. See signal-read-receipts design.md Dec. 5.
+  let receiptsSupported = false;
+  let hookRegistered = false;
+
+  /**
+   * Compare two semver-shaped strings. Returns -1/0/1.
+   * Permissive — extra labels (e.g. "0.13.4-snapshot") are ignored after the
+   * 3-tuple. NaN segments are treated as 0. We only care about >= 0.13.0,
+   * so a strict parser would be overkill.
+   */
+  function compareSemver(a: string, b: string): number {
+    const pa = a
+      .split(/[.+-]/)
+      .slice(0, 3)
+      .map((n) => parseInt(n, 10) || 0);
+    const pb = b
+      .split(/[.+-]/)
+      .slice(0, 3)
+      .map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < 3; i++) {
+      const av = pa[i] ?? 0;
+      const bv = pb[i] ?? 0;
+      if (av !== bv) return av < bv ? -1 : 1;
+    }
+    return 0;
+  }
+
+  /** Extract first <digits>.<digits>.<digits> from any string field on the
+   * RPC result, or null if nothing parses. signal-cli returns
+   * `{ version: "0.13.4" }`, but we stay permissive in case future builds
+   * add prefixes / suffixes. */
+  function parseVersion(result: unknown): string | null {
+    if (!result || typeof result !== 'object') return null;
+    for (const v of Object.values(result as Record<string, unknown>)) {
+      if (typeof v !== 'string') continue;
+      const m = v.match(/(\d+)\.(\d+)\.(\d+)/);
+      if (m) return `${m[1]}.${m[2]}.${m[3]}`;
+    }
+    return null;
+  }
+
+  /** Send a `read` receipt for the given Signal protocol timestamp. Swallows
+   * RPC errors — a failed receipt MUST NOT propagate into the host sweep
+   * loop. On a "method not found"-shaped error we flip the cached
+   * `receiptsSupported` so subsequent attempts no-op (self-healing in case
+   * version detection was wrong or the daemon was downgraded). */
+  async function sendReadReceipt(recipient: string, targetTimestamp: number): Promise<void> {
+    if (!connected || !tcp) return;
+    try {
+      // Shape pinned by signal-read-receipts spec: { recipient,
+      // targetTimestamps:[ts], type:'read' }. No `account` field — single-
+      // account daemon mode handles routing internally, and the test
+      // contract pins this exact shape.
+      await tcp.rpc('sendReceipt', {
+        recipient,
+        targetTimestamps: [targetTimestamp],
+        type: 'read',
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/method not found|unknown method|no such method/i.test(msg)) {
+        receiptsSupported = false;
+        log.warn('Signal: sendReceipt rejected by daemon, disabling receipts for this session', {
+          recipient,
+          targetTimestamp,
+          err: msg,
+        });
+      } else {
+        log.warn('Signal: sendReceipt RPC failed', { recipient, targetTimestamp, err: msg });
+      }
+    }
+  }
+
+  /** Completion-hook implementation registered for channel_type='signal'.
+   * See signal-read-receipts design.md Decision 2. */
+  async function onCompleted(msgIn: {
+    id: string;
+    platformId: string;
+    threadId: string | null;
+    agentGroupId: string;
+  }): Promise<void> {
+    if (!receiptsSupported) return;
+    if (msgIn.platformId.startsWith('group:')) return;
+    const ts = parseInt(msgIn.id, 10);
+    if (!Number.isFinite(ts) || String(ts) !== msgIn.id) {
+      log.debug('Signal: skipping receipt — synthetic-or-invalid-timestamp', {
+        messageId: msgIn.id,
+        platformId: msgIn.platformId,
+      });
+      return;
+    }
+    let settings;
+    try {
+      settings = getChannelSettings(msgIn.agentGroupId);
+    } catch (err) {
+      log.warn('Signal: getChannelSettings failed, skipping receipt', {
+        agentGroupId: msgIn.agentGroupId,
+        err,
+      });
+      return;
+    }
+    if (settings?.signal?.readReceipts === false) return;
+    await sendReadReceipt(msgIn.platformId, ts);
+  }
+
   // -- inbound handling --
 
   function handleNotification(method: string, params: unknown): void {
@@ -759,6 +875,22 @@ export function createSignalAdapter(config: {
 
   async function handleEnvelope(envelope: SignalEnvelope): Promise<void> {
     if (!setup) return;
+
+    // Peer receipt envelopes (read/viewed/delivery) — log only, no DB write,
+    // no further dispatch. Persistent storage of peer receipts is deferred
+    // (see signal-read-receipts proposal). We still need to recognize the
+    // envelope so it does not fall through to the dataMessage branch as a
+    // no-op and to give operators visibility via debug logs.
+    if (envelope.receiptMessage) {
+      const sender = (envelope.sourceNumber ?? envelope.sourceUuid ?? envelope.source ?? '').trim();
+      log.debug('Signal: inbound receipt envelope', {
+        direction: 'inbound-receipt',
+        sender,
+        type: envelope.receiptMessage.type,
+        timestamps: envelope.receiptMessage.timestamps ?? [],
+      });
+      return;
+    }
 
     // Sync messages (sent from another device)
     const syncSent = envelope.syncMessage?.sentMessage;
@@ -1150,6 +1282,45 @@ export function createSignalAdapter(config: {
         });
       } catch {
         log.debug('Signal: could not enable typing indicators');
+      }
+
+      // Read-receipt capability detection. Honored knobs (in priority order):
+      //   1. SIGNAL_FORCE_RECEIPTS_DISABLED=1 → off, ignore daemon version.
+      //   2. `version` RPC throws or returns unparseable payload → off.
+      //   3. detected version < 0.13.0 → off, warn naming the version.
+      //   4. detected version >= 0.13.0 → on.
+      // Logged at info regardless so operators can see the resolved value.
+      if (process.env.SIGNAL_FORCE_RECEIPTS_DISABLED === '1') {
+        receiptsSupported = false;
+        log.info('Signal: read receipts forced off via SIGNAL_FORCE_RECEIPTS_DISABLED');
+      } else {
+        try {
+          const versionResult = await tcp.rpc('version', {});
+          const detected = parseVersion(versionResult);
+          if (!detected) {
+            receiptsSupported = false;
+            log.warn('Signal: version RPC returned unparseable payload, disabling read receipts', {
+              result: versionResult,
+            });
+          } else if (compareSemver(detected, '0.13.0') < 0) {
+            receiptsSupported = false;
+            log.warn('Signal: signal-cli version below 0.13.0, disabling read receipts', { version: detected });
+          } else {
+            receiptsSupported = true;
+            log.info('Signal: read receipts enabled', { version: detected });
+          }
+        } catch (err) {
+          receiptsSupported = false;
+          log.warn('Signal: version RPC failed, disabling read receipts', { err });
+        }
+      }
+
+      // Register the completion hook once. Multiple setup() calls (e.g.
+      // reconnect path, tests) must not stack duplicate hooks on the
+      // registry — register-once + closure over the current state.
+      if (!hookRegistered) {
+        registerCompletionHook('signal', onCompleted);
+        hookRegistered = true;
       }
 
       connected = true;

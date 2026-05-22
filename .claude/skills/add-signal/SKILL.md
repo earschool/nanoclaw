@@ -236,6 +236,16 @@ INSERT OR IGNORE INTO agent_group_members (user_id, agent_group_id, added_by, ad
 
 Find the UUID from `messaging_groups.platform_id` or the `users` table.
 
+### Read receipts
+
+Read receipts are on by default for direct messages. Disable per agent group with:
+
+```bash
+ncl groups config update --id <agent-group-id> --channel-settings '{"signal":{"readReceipts":false}}'
+```
+
+See `docs/signal.md` for details (group exclusion, signal-cli version requirement, log shape for inbound peer receipts).
+
 ## Next Steps
 
 If you're in the middle of `/setup`, return to the setup flow now.

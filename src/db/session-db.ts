@@ -166,19 +166,50 @@ export function getMessageForRetry(
     .get(messageId, status) as { id: string; tries: number; processAfter: string | null } | undefined;
 }
 
-export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): void {
-  const completed = outDb
-    .prepare("SELECT message_id FROM processing_ack WHERE status IN ('completed', 'failed')")
-    .all() as Array<{ message_id: string }>;
+/**
+ * Result of `syncProcessingAcks`.
+ *
+ * Buckets the IDs whose `messages_in.status` actually transitioned from
+ * non-completed to completed in this call. Already-completed rows yield zero
+ * row-changes from the UPDATE and are excluded from both buckets, which
+ * gives the host-sweep an idempotent dispatch trigger — re-running the sweep
+ * on the same DB state returns `{ completedIds: [], failedIds: [] }`.
+ *
+ * Used by the host-sweep to dispatch per-channel completion hooks
+ * (Signal read receipts, etc.) without double-firing.
+ */
+export interface ProcessingAckSyncResult {
+  completedIds: string[];
+  failedIds: string[];
+}
 
-  if (completed.length === 0) return;
+export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): ProcessingAckSyncResult {
+  const acks = outDb
+    .prepare("SELECT message_id, status FROM processing_ack WHERE status IN ('completed', 'failed')")
+    .all() as Array<{ message_id: string; status: 'completed' | 'failed' }>;
 
+  if (acks.length === 0) return { completedIds: [], failedIds: [] };
+
+  const completedIds: string[] = [];
+  const failedIds: string[] = [];
+
+  // Primary effect (unchanged): mark every ack'd messages_in row as
+  // 'completed'. The WHERE clause guarantees idempotency — a row already in
+  // 'completed' yields zero changes, which we use to detect real transitions.
   const updateStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status != 'completed'");
   inDb.transaction(() => {
-    for (const { message_id } of completed) {
-      updateStmt.run(message_id);
+    for (const { message_id, status } of acks) {
+      const info = updateStmt.run(message_id);
+      if (info.changes === 0) continue;
+      if (status === 'completed') {
+        completedIds.push(message_id);
+      } else {
+        failedIds.push(message_id);
+      }
     }
   })();
+
+  return { completedIds, failedIds };
 }
 
 export function getStuckProcessingIds(outDb: Database.Database): string[] {
