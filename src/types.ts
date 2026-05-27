@@ -25,7 +25,15 @@ export interface ContainerConfigRow {
   packages_npm: string; // JSON: string[]
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
+  channel_settings: string; // JSON: ChannelSettings
   updated_at: string;
+}
+
+/** Per-channel runtime feature flags, persisted on container_configs. Resolved
+ *  at read time against hardcoded defaults so missing keys never surface as
+ *  `undefined` to consumers. */
+export interface ChannelSettings {
+  signal?: { readReceipts?: boolean };
 }
 
 export type UnknownSenderPolicy = 'strict' | 'request_approval' | 'public';

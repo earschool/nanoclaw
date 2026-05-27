@@ -5,10 +5,11 @@ import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
   getContainerConfig,
+  setChannelSettings,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
-import type { ContainerConfigRow } from '../../types.js';
+import type { ChannelSettings, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 /** Deserialize JSON columns for display. */
@@ -27,8 +28,38 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
+    channel_settings: JSON.parse(row.channel_settings),
     updated_at: row.updated_at,
   };
+}
+
+/**
+ * Parse a `--channel-settings '<json>'` flag value into a typed ChannelSettings
+ * object. Throws a user-friendly error on invalid JSON or non-object shape so
+ * the dispatcher surfaces it as `handler-error` rather than a bare crash.
+ *
+ * We keep validation deliberately shallow — per-channel keys (signal, future:
+ * discord, telegram) are passed through as-is. `getChannelSettings` is the
+ * resolver-of-record and merges them against hardcoded defaults at read time.
+ */
+function parseChannelSettingsFlag(raw: unknown): ChannelSettings {
+  if (typeof raw !== 'string') {
+    throw new Error('--channel-settings must be a JSON string, e.g. \'{"signal":{"readReceipts":false}}\'');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `--channel-settings must be valid JSON, e.g. '{"signal":{"readReceipts":false}}' (got: ${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('--channel-settings must be a JSON object, e.g. \'{"signal":{"readReceipts":false}}\'');
+  }
+  return parsed as ChannelSettings;
 }
 
 registerResource({
@@ -122,8 +153,10 @@ registerResource({
     'config update': {
       access: 'approval',
       description:
-        'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope.',
+        'Update container config fields. Scalar changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
+        '`--channel-settings` is the exception — it is consulted host-side at request time and takes effect immediately. ' +
+        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, ' +
+        "--max-messages-per-prompt, --cli-scope, --channel-settings '<json>'.",
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -151,13 +184,29 @@ registerResource({
           updates.cli_scope = scope;
         }
 
-        if (Object.keys(updates).length === 0) {
+        // --channel-settings carries a JSON payload (the same shape as the
+        // `channel_settings` column). Parsed and validated separately so the
+        // error message points at the right flag. Crud.ts's normalizeArgs
+        // turns the hyphenated CLI flag into the underscore key.
+        const channelSettingsRaw = args.channel_settings ?? args['channel-settings'];
+        const hasChannelSettings = channelSettingsRaw !== undefined;
+        let parsedChannelSettings: ChannelSettings | undefined;
+        if (hasChannelSettings) {
+          parsedChannelSettings = parseChannelSettingsFlag(channelSettingsRaw);
+        }
+
+        if (Object.keys(updates).length === 0 && !hasChannelSettings) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --channel-settings',
           );
         }
 
-        updateContainerConfigScalars(id, updates);
+        if (Object.keys(updates).length > 0) {
+          updateContainerConfigScalars(id, updates);
+        }
+        if (parsedChannelSettings) {
+          setChannelSettings(id, parsedChannelSettings);
+        }
 
         const updated = getContainerConfig(id)!;
         return presentConfig(updated);
