@@ -50,4 +50,6 @@ export {
   updateContainerConfigScalars,
   updateContainerConfigJson,
   deleteContainerConfig,
+  getChannelSettings,
+  setChannelSettings,
 } from './container-configs.js';

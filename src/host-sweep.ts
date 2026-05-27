@@ -45,7 +45,14 @@ import {
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { dispatchCompletionHooks } from './channels/channel-registry.js';
 import type { Session } from './types.js';
+
+interface CompletedMessageRow {
+  channel_type: string | null;
+  platform_id: string | null;
+  thread_id: string | null;
+}
 
 /**
  * SQLite TIMESTAMP columns store UTC without a timezone marker. Date.parse
@@ -166,9 +173,16 @@ async function sweepSession(session: Session): Promise<void> {
   }
 
   try {
-    // 1. Sync processing_ack → messages_in status
+    // 1. Sync processing_ack → messages_in status. The returned slice names
+    // ONLY the ids that actually transitioned this tick (not the running set
+    // of already-completed rows), so dispatch is naturally idempotent across
+    // sweeps. Failed ids skip the completion hook — see signal-read-receipts
+    // design.md Decision 1.
     if (outDb) {
-      syncProcessingAcks(inDb, outDb);
+      const { completedIds } = syncProcessingAcks(inDb, outDb);
+      if (completedIds.length > 0) {
+        await dispatchCompletionsForIds(inDb, completedIds, agentGroup.id);
+      }
     }
 
     // 2. Wake a container if work is due and nothing is running. Ordered
@@ -208,6 +222,39 @@ async function sweepSession(session: Session): Promise<void> {
   } finally {
     inDb.close();
     outDb?.close();
+  }
+}
+
+/**
+ * Look up routing info for each completed message and fire the registered
+ * completion hook for its channel type. Skips rows with null channel_type
+ * (system messages, a2a-internal) and rows that no longer exist in
+ * messages_in (defensive — shouldn't normally happen given the UPDATE that
+ * produced this list just matched the row).
+ *
+ * Awaits each dispatch sequentially per session so a slow Signal RPC for
+ * message A doesn't reorder relative to message B in the same session.
+ * Cross-session order is already serialized by the outer sweep loop.
+ */
+async function dispatchCompletionsForIds(inDb: Database.Database, ids: string[], agentGroupId: string): Promise<void> {
+  const stmt = inDb.prepare('SELECT channel_type, platform_id, thread_id FROM messages_in WHERE id = ?');
+  for (const id of ids) {
+    const row = stmt.get(id) as CompletedMessageRow | undefined;
+    if (!row) continue;
+    if (row.channel_type == null) continue;
+    try {
+      await dispatchCompletionHooks(row.channel_type, {
+        id,
+        platformId: row.platform_id ?? '',
+        threadId: row.thread_id,
+        agentGroupId,
+      });
+    } catch (err) {
+      // Belt-and-suspenders: dispatchCompletionHooks already isolates per-hook
+      // failures via Promise.allSettled. Catch here defends against future
+      // changes to the dispatcher contract that might surface errors.
+      log.warn('Completion-hook dispatch threw', { messageId: id, channelType: row.channel_type, err });
+    }
   }
 }
 

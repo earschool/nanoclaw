@@ -21,6 +21,85 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const registry = new Map<string, ChannelRegistration>();
 const activeAdapters = new Map<string, ChannelAdapter>();
 
+/**
+ * Per-channel hook invoked by the host-sweep after the agent container has
+ * finished processing an inbound message (i.e. `messages_in.status` just
+ * transitioned to 'completed' for a row whose container `processing_ack.status`
+ * was 'completed'). Failed transitions are NOT dispatched — host-sweep filters
+ * those out before calling `dispatchCompletionHooks`.
+ *
+ * The hook is opt-in. Channels that do not register one are skipped silently
+ * — the dispatcher does not log a warning for unregistered channel types.
+ *
+ * Errors thrown (or promises rejected) by a hook are isolated via
+ * Promise.allSettled and logged at warn level. They MUST NOT propagate to the
+ * sweep loop or affect sibling hooks for the same dispatch.
+ */
+export type CompletionHook = (msg: {
+  id: string;
+  platformId: string;
+  threadId: string | null;
+  agentGroupId: string;
+}) => void | Promise<void>;
+
+const completionHooks = new Map<string, CompletionHook[]>();
+
+/**
+ * Register a completion hook for a channel type. Multiple hooks are allowed
+ * per channel (useful for tests and for layered adapters). Dispatch order is
+ * not guaranteed — `Promise.allSettled` runs them concurrently.
+ */
+export function registerCompletionHook(channelType: string, hook: CompletionHook): void {
+  const list = completionHooks.get(channelType);
+  if (list) {
+    list.push(hook);
+  } else {
+    completionHooks.set(channelType, [hook]);
+  }
+}
+
+/**
+ * Dispatch all hooks registered for `channelType` with the given message
+ * payload. Resolves after every hook settles. Hooks that throw or reject are
+ * warn-logged and do not affect siblings.
+ *
+ * No-op (and no log) when there are no hooks for `channelType` — the common
+ * case for channels that don't implement completion semantics.
+ */
+export async function dispatchCompletionHooks(
+  channelType: string,
+  msg: { id: string; platformId: string; threadId: string | null; agentGroupId: string },
+): Promise<void> {
+  const hooks = completionHooks.get(channelType);
+  if (!hooks || hooks.length === 0) return;
+
+  const results = await Promise.allSettled(
+    hooks.map(async (hook) => {
+      // Wrap synchronous throws as well so Promise.allSettled catches them.
+      await hook(msg);
+    }),
+  );
+
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      log.warn('Completion hook rejected', {
+        channelType,
+        messageId: msg.id,
+        err: result.reason,
+      });
+    }
+  }
+}
+
+/**
+ * Test-only: clear the completion-hook registry. The production code never
+ * unregisters hooks (they live for the lifetime of the process), but tests
+ * that exercise the registry need a way to reset between cases.
+ */
+export function _resetCompletionHooksForTesting(): void {
+  completionHooks.clear();
+}
+
 /** Register a channel adapter factory. Called by channel modules on import. */
 export function registerChannelAdapter(name: string, registration: ChannelRegistration): void {
   registry.set(name, registration);
