@@ -89,6 +89,100 @@ function spawnSignalDaemon(cliPath: string, account: string, host: string, port:
 
 const RPC_TIMEOUT_MS = 15_000;
 
+/** Cap on per-recipient failures rendered into the Error message — bounds
+ *  log line length when a large group has many failed members. */
+const MAX_FAILURES_IN_MESSAGE = 20;
+
+/** Rich error built from a signal-cli JSON-RPC error response.
+ *
+ *  `allFailed`: true when every result in the response is non-SUCCESS (or
+ *  the response has no results array — treated as opaque failure). When
+ *  false, at least one recipient SUCCEEDED — used by group-send sites to
+ *  decide whether to rethrow (full failure → retry) or warn-and-return
+ *  (partial failure → don't re-deliver to SUCCESS recipients). */
+type SignalRpcError = Error & {
+  code?: number;
+  data?: unknown;
+  allFailed?: boolean;
+};
+
+/**
+ * Build a rich Error from a signal-cli JSON-RPC error response.
+ *
+ * signal-cli reports the actual send failure (UNREGISTERED_FAILURE,
+ * IDENTITY_FAILURE, NETWORK_FAILURE, …) inside `error.data.response.results`,
+ * while `error.message` stays generic ("Failed to send message"). We lift
+ * the per-recipient failure types into the Error's message so they survive
+ * structured-log serialization, and stash the raw error.data + code on the
+ * Error object for any callers that want to introspect.
+ *
+ * `err.data` is preserved on the object but is NOT serialized by the
+ * default logger (src/log.ts only emits message + stack). Callers that
+ * forward errors to external sinks (Sentry-style reporters, etc.) must
+ * scrub `data.response.results[].recipientAddress` before egress — the
+ * field carries phone numbers, UUIDs, and usernames together.
+ */
+function buildSignalRpcError(rpcError: { message?: string; code?: number; data?: unknown }): SignalRpcError {
+  const baseMessage = rpcError.message ?? 'Signal RPC error';
+  const summary = summarizeSendFailures(rpcError.data);
+  const message = summary ? `${baseMessage}: ${summary}` : baseMessage;
+  const err = new Error(message) as SignalRpcError;
+  if (rpcError.code !== undefined) err.code = rpcError.code;
+  if (rpcError.data !== undefined) err.data = rpcError.data;
+  err.allFailed = computeAllFailed(rpcError.data);
+  return err;
+}
+
+/** Returns true when the response has no SUCCESS result, false when at
+ *  least one recipient succeeded. Defaults to true for non-send error
+ *  shapes (no results array) so DM-style failures rethrow as before. */
+function computeAllFailed(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return true;
+  const response = (data as { response?: unknown }).response;
+  if (!response || typeof response !== 'object') return true;
+  const results = (response as { results?: unknown }).results;
+  if (!Array.isArray(results) || results.length === 0) return true;
+  return !results.some((r) => r && typeof r === 'object' && (r as { type?: unknown }).type === 'SUCCESS');
+}
+
+/**
+ * Extract per-recipient failure types + addresses from a signal-cli send
+ * error payload, formatted as a compact "TYPE for recipient" list.
+ * Returns null for shapes that don't look like a send response — callers
+ * fall back to the generic RPC message. Iteration is capped at
+ * MAX_FAILURES_IN_MESSAGE entries with a trailing `… +N more` suffix so
+ * the error message stays bounded for very large groups.
+ */
+function summarizeSendFailures(data: unknown): string | null {
+  if (!data || typeof data !== 'object') return null;
+  const response = (data as { response?: unknown }).response;
+  if (!response || typeof response !== 'object') return null;
+  const results = (response as { results?: unknown }).results;
+  if (!Array.isArray(results) || results.length === 0) return null;
+
+  const parts: string[] = [];
+  let overflow = 0;
+  for (const r of results) {
+    if (!r || typeof r !== 'object') continue;
+    const type = (r as { type?: unknown }).type;
+    if (typeof type !== 'string' || type === 'SUCCESS') continue;
+    if (parts.length >= MAX_FAILURES_IN_MESSAGE) {
+      overflow++;
+      continue;
+    }
+    const addr = (r as { recipientAddress?: unknown }).recipientAddress;
+    let recipient = 'unknown';
+    if (addr && typeof addr === 'object') {
+      const a = addr as { number?: string | null; uuid?: string | null; username?: string | null };
+      recipient = a.number ?? a.uuid ?? a.username ?? 'unknown';
+    }
+    parts.push(`${type} for ${recipient}`);
+  }
+  if (parts.length === 0) return null;
+  const summary = parts.join('; ');
+  return overflow > 0 ? `${summary}; … +${overflow} more` : summary;
+}
+
 class SignalTcpClient {
   private socket: Socket | null = null;
   private buffer = '';
@@ -194,7 +288,7 @@ class SignalTcpClient {
       this.pending.delete(parsed.id);
       clearTimeout(p.timer);
       if (parsed.error) {
-        p.reject(new Error(parsed.error.message ?? 'Signal RPC error'));
+        p.reject(buildSignalRpcError(parsed.error));
       } else {
         p.resolve(parsed.result);
       }
@@ -1062,13 +1156,21 @@ export function createSignalAdapter(config: {
   // -- send helpers --
 
   async function sendText(platformId: string, text: string): Promise<void> {
-    if (!connected || !tcp) return;
-
-    echoCache.remember(platformId, text);
+    if (!connected || !tcp) {
+      throw new Error('Signal channel not connected');
+    }
 
     const MAX_CHUNK = 4000;
     const chunks = text.length <= MAX_CHUNK ? [text] : chunkText(text, MAX_CHUNK);
 
+    // Multi-chunk failure tradeoff: chunks send sequentially; a rethrow from
+    // chunk N+1 leaves chunks 1..N on the recipient's screen, and the
+    // delivery layer's retry (MAX_DELIVERY_ATTEMPTS=3) re-runs the whole
+    // sendText, so earlier chunks may be delivered up to 3 times. Accepted
+    // here because the alternative (swallow and mark delivered) silently
+    // truncates the user's message — a worse failure mode. Per-chunk
+    // idempotency would need msg_id-keyed state across deliver() calls,
+    // out of scope for the adapter.
     for (const chunk of chunks) {
       try {
         const { text: plainText, textStyles } = parseSignalStyles(chunk);
@@ -1087,7 +1189,11 @@ export function createSignalAdapter(config: {
         try {
           await tcp.rpc('send', params);
         } catch (styledErr) {
-          if (textStyles.length > 0) {
+          // Only retry without textStyle for plausibly-style-related
+          // failures. Per-recipient terminal failures (UNREGISTERED,
+          // IDENTITY, NETWORK) have nothing to do with markup syntax —
+          // retrying doubles signal-cli's load with no chance of success.
+          if (textStyles.length > 0 && !(styledErr as SignalRpcError)?.data) {
             log.debug('Signal: textStyle rejected, retrying with markup');
             delete params.textStyle;
             params.message = chunk;
@@ -1096,12 +1202,40 @@ export function createSignalAdapter(config: {
             throw styledErr;
           }
         }
+        // Remember per-chunk, on success only. signal-cli echoes each
+        // chunk back as a separate syncMessage, so the cache must key by
+        // the on-wire chunk text (plainText) for handleEnvelope.isEcho to
+        // suppress them. A throw before this point leaves no stale entry
+        // priming the cache against a future legitimate inbound.
+        echoCache.remember(platformId, plainText);
       } catch (err) {
+        if (shouldAbsorbPartialFailure(err, platformId)) {
+          log.warn('Signal: partial group send — some recipients failed', {
+            platformId,
+            chunkIndex: chunks.indexOf(chunk),
+            err,
+          });
+          continue;
+        }
+        // Surface the failure so the delivery layer can retry / markFailed.
+        // Swallowing here would let drainSession mark the message delivered
+        // when nothing reached the recipient.
         log.error('Signal: send failed', { platformId, err });
+        throw err;
       }
     }
 
     log.info('Signal message sent', { platformId, length: text.length });
+  }
+
+  /** A group send where signal-cli reports at least one SUCCESS recipient
+   *  is treated as "delivered enough" — rethrowing would trigger a full
+   *  retry that re-delivers to every SUCCESS member of the group. DM
+   *  failures (no platformId 'group:' prefix) always propagate. */
+  function shouldAbsorbPartialFailure(err: unknown, platformId: string): boolean {
+    if (!platformId.startsWith('group:')) return false;
+    const e = err as SignalRpcError;
+    return e?.allFailed === false;
   }
 
   /**
@@ -1115,18 +1249,25 @@ export function createSignalAdapter(config: {
    * caption colliding with signal-cli's per-message size limits.
    */
   async function sendAttachments(platformId: string, files: { filename: string; data: Buffer }[]): Promise<void> {
-    if (!connected || !tcp) return;
+    if (!connected || !tcp) {
+      throw new Error('Signal channel not connected');
+    }
     if (files.length === 0) return;
 
     const tempPaths: string[] = [];
-    for (const file of files) {
-      const safeName = file.filename.replace(/[/\\\0]/g, '_');
-      const tempPath = join(tmpdir(), `signal-out-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
-      writeFileSync(tempPath, file.data);
-      tempPaths.push(tempPath);
-    }
-
     try {
+      // Stage files inside the try so a writeFileSync mid-loop still hits
+      // the finally for cleanup of partially-written tempPaths.
+      for (const file of files) {
+        const safeName = file.filename.replace(/[/\\\0]/g, '_');
+        const tempPath = join(
+          tmpdir(),
+          `signal-out-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`,
+        );
+        writeFileSync(tempPath, file.data);
+        tempPaths.push(tempPath);
+      }
+
       const params: Record<string, unknown> = { attachments: tempPaths };
       if (config.account) params.account = config.account;
       if (platformId.startsWith('group:')) {
@@ -1134,10 +1275,23 @@ export function createSignalAdapter(config: {
       } else {
         params.recipient = [platformId];
       }
-      await tcp.rpc('send', params);
+      try {
+        await tcp.rpc('send', params);
+      } catch (err) {
+        if (shouldAbsorbPartialFailure(err, platformId)) {
+          log.warn('Signal: partial group attachment send — some recipients failed', {
+            platformId,
+            count: files.length,
+            err,
+          });
+        } else {
+          throw err;
+        }
+      }
       log.info('Signal attachments sent', { platformId, count: files.length, filenames: files.map((f) => f.filename) });
     } catch (err) {
       log.error('Signal: attachment send failed', { platformId, count: files.length, err });
+      throw err;
     } finally {
       for (const p of tempPaths) {
         try {
@@ -1157,8 +1311,7 @@ export function createSignalAdapter(config: {
    */
   async function sendApprovalCard(platformId: string, content: AskQuestionContent): Promise<void> {
     if (!connected || !tcp) {
-      log.warn('Signal: approval card skipped — not connected', { platformId });
-      return;
+      throw new Error('Signal channel not connected');
     }
     const { body, options } = formatApprovalText(content);
     const { text: plainText, textStyles } = parseSignalStyles(body);
@@ -1179,7 +1332,9 @@ export function createSignalAdapter(config: {
       try {
         result = await tcp.rpc<{ timestamp?: number }>('send', params);
       } catch (styledErr) {
-        if (textStyles.length > 0) {
+        // Gate retry on textStyle-shaped failures only — see sendText for
+        // the same rationale.
+        if (textStyles.length > 0 && !(styledErr as SignalRpcError)?.data) {
           log.debug('Signal: textStyle rejected on approval, retrying with raw markup');
           delete params.textStyle;
           params.message = body;
@@ -1202,7 +1357,16 @@ export function createSignalAdapter(config: {
         });
       }
     } catch (err) {
+      if (shouldAbsorbPartialFailure(err, platformId)) {
+        log.warn('Signal: partial group approval card send — some recipients failed', {
+          platformId,
+          questionId: content.questionId,
+          err,
+        });
+        return;
+      }
       log.error('Signal: approval card send failed', { platformId, questionId: content.questionId, err });
+      throw err;
     }
   }
 
@@ -1251,10 +1415,12 @@ export function createSignalAdapter(config: {
       tcp = new SignalTcpClient(config.tcpHost, config.tcpPort);
       await tcp.connect({
         onNotification: handleNotification,
-        // Signal the adapter that the daemon dropped us. No auto-reconnect yet
-        // — subsequent deliver/setTyping calls short-circuit on `connected`
-        // and log rather than throw into the retry loop. Operators see this in
-        // logs/nanoclaw.log and can restart the service.
+        // Signal the adapter that the daemon dropped us. No auto-reconnect
+        // yet — subsequent deliver() calls throw "Signal channel not
+        // connected" so the delivery layer retries (giving a manual
+        // signal-cli restart a chance) and eventually markFailed. setTyping
+        // still short-circuits silently because the typing module re-fires
+        // on a heartbeat — a missed tick is not user-visible data loss.
         onClose: () => {
           if (!connected) return;
           connected = false;
