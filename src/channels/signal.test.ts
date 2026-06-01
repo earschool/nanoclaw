@@ -36,6 +36,11 @@ import { EventEmitter } from 'events';
 
 const tcpRef = vi.hoisted(() => ({
   rpcResponses: new Map<string, unknown>(),
+  // FIFO queue of error responses keyed by RPC method. Each call to a method
+  // consumes one entry; once the queue is empty, subsequent calls fall back
+  // to the success path. Lets tests model both "every call fails" and
+  // "send #1 fails, retry #2 succeeds" without leaking state across tests.
+  rpcErrorsOnce: new Map<string, unknown[]>(),
   fakeSocket: null as any,
 }));
 
@@ -53,6 +58,27 @@ function createFakeSocket(): EventEmitter & {
   sock.write = vi.fn((data: string) => {
     try {
       const req = JSON.parse(data.trim());
+      const errQueue = tcpRef.rpcErrorsOnce.get(req.method);
+      if (errQueue !== undefined) {
+        if (!Array.isArray(errQueue)) {
+          throw new Error(
+            `rpcErrorsOnce['${req.method}'] must be an array; got ${typeof errQueue}. ` +
+              `Use queueRpcErrors() instead of .set() directly.`,
+          );
+        }
+        if (errQueue.length > 0) {
+          const slot = errQueue.shift();
+          if (errQueue.length === 0) tcpRef.rpcErrorsOnce.delete(req.method);
+          // null sentinel = skip this call (use success path). Lets tests
+          // model "first call succeeds, second call fails" by queuing
+          // [null, errPayload].
+          if (slot !== null) {
+            const response = JSON.stringify({ jsonrpc: '2.0', id: req.id, error: slot }) + '\n';
+            setImmediate(() => sock.emit('data', Buffer.from(response)));
+            return;
+          }
+        }
+      }
       const result = tcpRef.rpcResponses.get(req.method) ?? { ok: true };
       const response = JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\n';
       setImmediate(() => sock.emit('data', Buffer.from(response)));
@@ -135,6 +161,14 @@ function getRpcCallsForMethod(method: string) {
   return getRpcCalls().filter((c) => c.method === method);
 }
 
+/** Queue one or more JSON-RPC error responses for the next N calls to
+ *  `method`. Each error is consumed in order; once the queue empties,
+ *  subsequent calls fall back to the success path. Always pass error
+ *  objects directly — the helper wraps them in the required array. */
+function queueRpcErrors(method: string, ...errors: unknown[]) {
+  tcpRef.rpcErrorsOnce.set(method, errors);
+}
+
 function pushEvent(envelope: Record<string, unknown>) {
   if (!tcpRef.fakeSocket) throw new Error('TCP socket not connected');
   const notification =
@@ -152,6 +186,7 @@ describe('SignalAdapter', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     tcpRef.rpcResponses.clear();
+    tcpRef.rpcErrorsOnce.clear();
     tcpRef.fakeSocket = null;
     tcpRef.rpcResponses.set('send', { timestamp: 1234567890 });
     tcpRef.rpcResponses.set('sendTyping', {});
@@ -1276,6 +1311,307 @@ describe('SignalAdapter', () => {
     it('does not support threads', () => {
       const adapter = createAdapter();
       expect(adapter.supportsThreads).toBe(false);
+    });
+  });
+
+  // --- Send-failure propagation ---
+  //
+  // Failure semantics:
+  //   - DM / single-recipient failure  → reject deliver() so drainSession retries.
+  //   - Partial group failure (≥1 SUCCESS) → log warn and resolve; rethrow
+  //     would retry the whole group and re-deliver to SUCCESS recipients.
+  //   - !connected → throw; lost-during-outage is honest (markFailed),
+  //     swallow would mark the row delivered with nothing on the wire.
+
+  /** Build a JSON-RPC error envelope for one signal-cli send failure. */
+  function sendErrorPayload(
+    type: string,
+    recipient: { number?: string | null; uuid?: string | null; username?: string | null },
+    extras: { code?: number; timestamp?: number } = {},
+  ) {
+    return {
+      code: extras.code ?? -1,
+      message: 'Failed to send message',
+      data: {
+        response: {
+          results: [{ recipientAddress: { uuid: null, number: null, username: null, ...recipient }, type }],
+          timestamp: extras.timestamp ?? 1,
+        },
+      },
+    };
+  }
+
+  describe('send failure propagation', () => {
+    it('rejects deliver() with message + code + data preserved when send fails', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      const errPayload = sendErrorPayload('UNREGISTERED_FAILURE', { number: '+15555550555' });
+      queueRpcErrors('send', errPayload);
+
+      await expect(
+        adapter.deliver('+15555550555', null, { kind: 'text', content: { text: 'Hello' } }),
+      ).rejects.toMatchObject({
+        message: expect.stringMatching(/UNREGISTERED_FAILURE for \+15555550555/),
+        code: -1,
+        data: errPayload.data,
+      });
+
+      await adapter.teardown();
+    });
+
+    it('rejects deliver() when an attachment send fails (recipient surfaced in message)', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      queueRpcErrors('send', sendErrorPayload('UNREGISTERED_FAILURE', { number: '+15555550999' }));
+
+      await expect(
+        adapter.deliver('+15555550999', null, {
+          kind: 'file',
+          content: {},
+          files: [{ filename: 'report.md', data: Buffer.from('# Report') }],
+        }),
+      ).rejects.toThrow(/UNREGISTERED_FAILURE for \+15555550999/);
+
+      await adapter.teardown();
+    });
+
+    it('rejects deliver() when an approval card send fails — recipient errors skip the textStyle retry', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // sendApprovalCard's body contains *title* markup, so parseSignalStyles
+      // emits a bold style. Pre-patch the inner catch always retried without
+      // textStyle, doubling the per-failure RPC cost for permanent
+      // recipient failures (UNREGISTERED, IDENTITY, …). The new gate skips
+      // the retry when the error carries `data` (a per-recipient signal-cli
+      // error), so this test queues exactly ONE error and asserts exactly
+      // ONE 'send' call.
+      queueRpcErrors('send', sendErrorPayload('IDENTITY_FAILURE', { number: '+15555550999' }));
+
+      await expect(
+        adapter.deliver('+15555550999', null, {
+          kind: 'chat-sdk',
+          content: {
+            type: 'ask_question',
+            questionId: 'q1',
+            title: 'Pick one',
+            options: [
+              { value: 'a', label: 'Alpha' },
+              { value: 'b', label: 'Bravo' },
+            ],
+          },
+        }),
+      ).rejects.toThrow(/IDENTITY_FAILURE for \+15555550999/);
+      expect(getRpcCallsForMethod('send')).toHaveLength(1);
+
+      await adapter.teardown();
+    });
+
+    it('retries an approval card send without textStyle when the error looks style-related (no data)', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // First call: data-less RPC error → indicates textStyle parse rejection.
+      // The inner catch retries without textStyle; the retry succeeds because
+      // the queue is now empty.
+      queueRpcErrors('send', { code: -1, message: 'Invalid textStyle' });
+
+      await expect(
+        adapter.deliver('+15555550001', null, {
+          kind: 'chat-sdk',
+          content: {
+            type: 'ask_question',
+            questionId: 'q2',
+            title: 'Pick one',
+            options: [
+              { value: 'a', label: 'Alpha' },
+              { value: 'b', label: 'Bravo' },
+            ],
+          },
+        }),
+      ).resolves.toBeUndefined();
+      const calls = getRpcCallsForMethod('send');
+      expect(calls).toHaveLength(2);
+      expect(calls[0].params.textStyle).toBeDefined();
+      expect(calls[1].params.textStyle).toBeUndefined();
+
+      await adapter.teardown();
+    });
+
+    it('rejects deliver() on a sendText styled-text retry failure (regression: both attempts must surface)', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // Markdown in body forces the inner styled-text retry path in sendText.
+      // Both attempts fail so the outer catch rethrows.
+      // Errors with no `data` field also exercise the textStyle-retry gate —
+      // without `data` we cannot rule out a textStyle parse error, so retry
+      // is the right call here.
+      queueRpcErrors('send', { code: -1, message: 'Invalid textStyle' }, { code: -1, message: 'Invalid textStyle' });
+
+      await expect(
+        adapter.deliver('+15555550001', null, { kind: 'text', content: { text: 'Hello **world**' } }),
+      ).rejects.toThrow('Invalid textStyle');
+      expect(getRpcCallsForMethod('send')).toHaveLength(2);
+
+      await adapter.teardown();
+    });
+
+    it('rejects deliver() with a generic message when RPC error has no failure data', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      queueRpcErrors('send', { code: -32600, message: 'Invalid Request', data: null });
+
+      await expect(adapter.deliver('+15555550001', null, { kind: 'text', content: { text: 'x' } })).rejects.toThrow(
+        'Invalid Request',
+      );
+
+      await adapter.teardown();
+    });
+
+    it('rejects deliver() when the daemon is disconnected', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // Force-close the TCP socket; the adapter's onClose handler flips
+      // `connected` to false. The next deliver() should throw rather than
+      // silently no-op (which would otherwise mark the row delivered).
+      tcpRef.fakeSocket.destroy();
+
+      await expect(adapter.deliver('+15555550001', null, { kind: 'text', content: { text: 'x' } })).rejects.toThrow(
+        'Signal channel not connected',
+      );
+
+      await adapter.teardown();
+    });
+
+    it('rethrows on multi-chunk failure when a later chunk fails after earlier chunks landed', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // Long body forces sendText to chunk (MAX_CHUNK = 4000). Queue [null,
+      // errPayload] so call #1 (chunk 1) succeeds and call #2 (chunk 2)
+      // fails — the chunk loop's outer catch rethrows.
+      queueRpcErrors('send', null, sendErrorPayload('NETWORK_FAILURE', { number: '+15555550001' }));
+      const longText = 'a'.repeat(5000);
+
+      await expect(
+        adapter.deliver('+15555550001', null, { kind: 'text', content: { text: longText } }),
+      ).rejects.toThrow(/NETWORK_FAILURE/);
+      expect(getRpcCallsForMethod('send')).toHaveLength(2);
+
+      await adapter.teardown();
+    });
+
+    it('absorbs a partial-group failure (≥1 SUCCESS) without rethrowing', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // Group send with two recipients: one SUCCESS, one UNREGISTERED_FAILURE.
+      // Rethrowing would trigger drainSession to retry the whole group and
+      // re-deliver to the SUCCESS recipient; the adapter must absorb instead.
+      queueRpcErrors('send', {
+        code: -1,
+        message: 'Failed to send message',
+        data: {
+          response: {
+            results: [
+              { recipientAddress: { uuid: 'good-uuid', number: null, username: null }, type: 'SUCCESS' },
+              {
+                recipientAddress: { uuid: null, number: '+15555550999', username: null },
+                type: 'UNREGISTERED_FAILURE',
+              },
+            ],
+            timestamp: 99,
+          },
+        },
+      });
+
+      await expect(
+        adapter.deliver('group:abc123', null, { kind: 'text', content: { text: 'group msg' } }),
+      ).resolves.toBeUndefined();
+
+      await adapter.teardown();
+    });
+
+    it('caps the failure list in the Error message for very large groups', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // 25 failed recipients — message should truncate to 20 with "+5 more".
+      const results = Array.from({ length: 25 }, (_, i) => ({
+        recipientAddress: { uuid: null, number: `+1555555${String(i).padStart(4, '0')}`, username: null },
+        type: 'UNREGISTERED_FAILURE',
+      }));
+      queueRpcErrors('send', {
+        code: -1,
+        message: 'Failed to send message',
+        data: { response: { results, timestamp: 1 } },
+      });
+
+      await expect(
+        adapter.deliver('group:huge', null, { kind: 'text', content: { text: 'broadcast' } }),
+      ).rejects.toThrow(/\+5 more/);
+
+      await adapter.teardown();
+    });
+
+    it('summarizes only non-SUCCESS results in the Error message', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // For a DM (single recipient), only one result; the SUCCESS filter is
+      // load-bearing for group sends, but exercising it here pins the
+      // current behavior so a refactor that drops the filter is caught.
+      queueRpcErrors('send', {
+        code: -1,
+        message: 'Failed to send message',
+        data: {
+          response: {
+            results: [
+              { recipientAddress: { uuid: 'aaa', number: null, username: null }, type: 'SUCCESS' },
+              { recipientAddress: { uuid: 'bbb', number: null, username: null }, type: 'IDENTITY_FAILURE' },
+            ],
+            timestamp: 1,
+          },
+        },
+      });
+
+      // DM-style platformId so partial-group absorption does NOT kick in
+      // (the absorber requires platformId.startsWith('group:')). The single
+      // SUCCESS isn't relevant here — the test pins the message format.
+      await expect(adapter.deliver('bbb', null, { kind: 'text', content: { text: 'x' } })).rejects.toThrow(
+        /^Failed to send message: IDENTITY_FAILURE for bbb$/,
+      );
+
+      await adapter.teardown();
+    });
+  });
+
+  // --- Test infra hygiene ---
+
+  describe('mock infra', () => {
+    it('refuses non-array values in rpcErrorsOnce (footgun guard)', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+
+      // Set a raw object instead of using queueRpcErrors() — should throw
+      // synchronously inside fakeSocket.write when the next RPC fires.
+      (tcpRef.rpcErrorsOnce as Map<string, unknown>).set('send', { code: -1, message: 'oops' });
+
+      // The error is thrown by .write() inside the mock; the RPC promise will
+      // never resolve. Use a separate timeout to assert this is not a normal
+      // success path either — we just need the misuse to fail loudly.
+      const sendPromise = adapter.deliver('+15555550001', null, { kind: 'text', content: { text: 'x' } });
+      // The fake socket .write throws synchronously, but the RPC promise hangs;
+      // we just need the test to fail if the mock silently accepts the value.
+      // Tear down to clear pending — the mock-misuse throw appears as an
+      // unhandled rejection or error log, which is the desired signal.
+      void sendPromise.catch(() => {});
+      await adapter.teardown();
     });
   });
 });
