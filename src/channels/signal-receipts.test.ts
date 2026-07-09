@@ -101,7 +101,11 @@ function getRpcCallsForMethod(method: string) {
 }
 
 function dmHookMsg(id: string) {
-  return { id, platformId: '+15555550123', threadId: null, agentGroupId: 'ag-1' };
+  return { id, platformId: '+15555550123', threadId: null, agentGroupId: 'ag-1', sender: '+15555550123' };
+}
+
+function groupHookMsg(id: string, sender: string | null) {
+  return { id, platformId: 'group:abc123', threadId: null, agentGroupId: 'ag-1', sender };
 }
 
 beforeEach(() => {
@@ -136,6 +140,7 @@ describe('signal sendReadReceipt RPC shape', () => {
       platformId: '+15555555555',
       threadId: null,
       agentGroupId: 'ag-1',
+      sender: '+15555555555',
     });
     const calls = getRpcCallsForMethod('sendReceipt');
     expect(calls.length).toBe(1);
@@ -188,15 +193,33 @@ describe('signal completion-hook firing', () => {
     await adapter.teardown();
   });
 
-  it('does not fire for group platformId regardless of config', async () => {
+  it('fires for group platformId, addressing the receipt to the original sender (not the group id)', async () => {
     const adapter = createAdapter();
     await adapter.setup(createMockSetup());
-    await dispatchCompletionHooks('signal', {
-      id: '1700000000000',
-      platformId: 'group:abc123',
-      threadId: null,
-      agentGroupId: 'ag-1',
+    await dispatchCompletionHooks('signal', groupHookMsg('1700000000000', '+15555550999'));
+    const calls = getRpcCallsForMethod('sendReceipt');
+    expect(calls.length).toBe(1);
+    expect(calls[0].params).toEqual({
+      recipient: '+15555550999',
+      targetTimestamps: [1700000000000],
+      type: 'read',
     });
+    await adapter.teardown();
+  });
+
+  it('skips group receipt when sender is missing (e.g. unparseable content)', async () => {
+    const adapter = createAdapter();
+    await adapter.setup(createMockSetup());
+    await dispatchCompletionHooks('signal', groupHookMsg('1700000000000', null));
+    expect(getRpcCallsForMethod('sendReceipt').length).toBe(0);
+    await adapter.teardown();
+  });
+
+  it('respects readReceipts=false for groups too', async () => {
+    const adapter = createAdapter();
+    await adapter.setup(createMockSetup());
+    vi.mocked(getChannelSettings).mockReturnValue({ signal: { readReceipts: false } });
+    await dispatchCompletionHooks('signal', groupHookMsg('1700000000000', '+15555550999'));
     expect(getRpcCallsForMethod('sendReceipt').length).toBe(0);
     await adapter.teardown();
   });
@@ -227,12 +250,37 @@ describe('signal completion-hook firing', () => {
       platformId: '+15555550123',
       threadId: null,
       agentGroupId: 'ag-1',
+      sender: '+15555550123',
     });
     expect(getRpcCallsForMethod('sendReceipt').length).toBe(0);
     const matched = vi
       .mocked(log.debug)
       .mock.calls.some((c) => /synthetic-or-invalid-timestamp|invalid timestamp/i.test(String(c[0])));
     expect(matched).toBe(true);
+    await adapter.teardown();
+  });
+
+  // Regression: router (src/router.ts) composes inbound ids as
+  // `${signalTimestamp}:${agentGroupId}`. Earlier code parseInt-ed the whole
+  // string then strict-equal-checked against the original — every signal
+  // message failed and the hook silently early-returned.
+  it('extracts the timestamp prefix from router-composed `${ts}:${agentGroupId}` ids', async () => {
+    const adapter = createAdapter();
+    await adapter.setup(createMockSetup());
+    await dispatchCompletionHooks('signal', {
+      id: '1700000000000:ag-1778766760008-8v8wnj',
+      platformId: '+15555550123',
+      threadId: null,
+      agentGroupId: 'ag-1778766760008-8v8wnj',
+      sender: '+15555550123',
+    });
+    const calls = getRpcCallsForMethod('sendReceipt');
+    expect(calls.length).toBe(1);
+    expect(calls[0].params).toEqual({
+      recipient: '+15555550123',
+      targetTimestamps: [1700000000000],
+      type: 'read',
+    });
     await adapter.teardown();
   });
 });

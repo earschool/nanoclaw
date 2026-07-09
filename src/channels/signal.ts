@@ -857,17 +857,36 @@ export function createSignalAdapter(config: {
   }
 
   /** Completion-hook implementation registered for channel_type='signal'.
-   * See signal-read-receipts design.md Decision 2. */
+   * See signal-read-receipts design.md Decision 2.
+   *
+   * Read receipts in the Signal protocol are always addressed to the original
+   * sender — never to a group — because the recipient's app correlates the
+   * (sender, targetTimestamp) pair back to its own copy of the message. For
+   * DMs the inbound row's `platform_id` IS the sender. For group inbound,
+   * `platform_id` is `group:<groupId>` and the actual sender lives in the
+   * row's content JSON, surfaced via `msgIn.sender`. */
   async function onCompleted(msgIn: {
     id: string;
     platformId: string;
     threadId: string | null;
     agentGroupId: string;
+    sender: string | null;
   }): Promise<void> {
     if (!receiptsSupported) return;
-    if (msgIn.platformId.startsWith('group:')) return;
-    const ts = parseInt(msgIn.id, 10);
-    if (!Number.isFinite(ts) || String(ts) !== msgIn.id) {
+    const isGroup = msgIn.platformId.startsWith('group:');
+    const recipient = isGroup ? msgIn.sender : msgIn.platformId;
+    if (!recipient) {
+      log.debug('Signal: skipping receipt — no sender for group message', {
+        messageId: msgIn.id,
+        platformId: msgIn.platformId,
+      });
+      return;
+    }
+    // Router composes id as `${signalTimestamp}:${agentGroupId}` (router.ts).
+    // Strip the agent-group suffix before validating as a Signal timestamp.
+    const tsPart = msgIn.id.split(':', 1)[0];
+    const ts = parseInt(tsPart, 10);
+    if (!Number.isFinite(ts) || String(ts) !== tsPart) {
       log.debug('Signal: skipping receipt — synthetic-or-invalid-timestamp', {
         messageId: msgIn.id,
         platformId: msgIn.platformId,
@@ -885,7 +904,7 @@ export function createSignalAdapter(config: {
       return;
     }
     if (settings?.signal?.readReceipts === false) return;
-    await sendReadReceipt(msgIn.platformId, ts);
+    await sendReadReceipt(recipient, ts);
   }
 
   // -- inbound handling --
@@ -1109,6 +1128,19 @@ export function createSignalAdapter(config: {
     // we don't wake the agent for an empty payload.
     if (!content && attachmentRefs.length === 0) return;
 
+    // Mention-of-bot detection. Two paths Signal users invoke a bot in a
+    // group: (a) explicit @-mention via Signal's mention protocol (the bot's
+    // number/UUID lives in dataMessage.mentions[]); (b) quote-reply to one
+    // of the bot's prior messages (dataMessage.quote.author* matches the
+    // bot's account). Either path sets isMention=true so the router can
+    // engage even when the message body has no agent-name text. UUID match
+    // is skipped because the host doesn't track the bot's own UUID — number
+    // comparison is sufficient for current signal-cli versions.
+    const isMentionOfBot =
+      (dataMessage.mentions ?? []).some((m) => m.number === config.account) ||
+      (dataMessage.quote != null &&
+        (dataMessage.quote.authorNumber === config.account || dataMessage.quote.author === config.account));
+
     const msg: InboundMessage = {
       id: String(dataMessage.timestamp ?? Date.now()),
       kind: 'chat',
@@ -1121,6 +1153,8 @@ export function createSignalAdapter(config: {
         ...(dataMessage.quote ? quoteToContent(dataMessage.quote) : {}),
       },
       timestamp,
+      isMention: isMentionOfBot,
+      isGroup,
     };
     await setup.onInbound(platformId, null, msg);
 
@@ -1128,6 +1162,7 @@ export function createSignalAdapter(config: {
       platformId,
       sender: senderName,
       attachments: attachmentRefs.length,
+      isMention: isMentionOfBot,
     });
   }
 

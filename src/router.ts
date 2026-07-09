@@ -370,6 +370,11 @@ function evaluateEngage(
 ): boolean {
   switch (agent.engage_mode) {
     case 'pattern': {
+      // Platform-confirmed mention always engages — covers Signal native
+      // @-mentions and quote-replies to the bot's own prior messages, where
+      // the message body has no agent-name text. Falls through to regex on
+      // adapters that don't set isMention (legacy native channels).
+      if (isMention) return true;
       const pat = agent.engage_pattern ?? '.';
       if (pat === '.') return true;
       try {

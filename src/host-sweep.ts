@@ -52,6 +52,24 @@ interface CompletedMessageRow {
   channel_type: string | null;
   platform_id: string | null;
   thread_id: string | null;
+  content: string | null;
+}
+
+/**
+ * Extract the original sender's channel-native handle from a messages_in
+ * content JSON blob. Returns null when the blob isn't JSON or carries no
+ * usable `sender` field (a2a rows, pre-migration data). Tolerant by design:
+ * receipt dispatch is best-effort and a missing sender just means the hook
+ * may decide to skip — never an exception.
+ */
+function parseSenderFromContent(raw: string | null): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { sender?: unknown };
+    return typeof parsed.sender === 'string' && parsed.sender.length > 0 ? parsed.sender : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -65,7 +83,7 @@ export function parseSqliteUtc(s: string): number {
   return Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + 'Z');
 }
 
-const SWEEP_INTERVAL_MS = 60_000;
+const SWEEP_INTERVAL_MS = 5_000;
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
@@ -173,15 +191,15 @@ async function sweepSession(session: Session): Promise<void> {
   }
 
   try {
-    // 1. Sync processing_ack → messages_in status. The returned slice names
-    // ONLY the ids that actually transitioned this tick (not the running set
-    // of already-completed rows), so dispatch is naturally idempotent across
-    // sweeps. Failed ids skip the completion hook — see signal-read-receipts
-    // design.md Decision 1.
+    // 1. Sync processing_ack → messages_in status. Hook dispatch fires on the
+    // pickup transition (pending → processing) so read-receipts land as soon
+    // as the container claims the row, not after the LLM roundtrip. The
+    // completed/failed buckets are still computed for terminal-status sync
+    // but no longer drive the hook.
     if (outDb) {
-      const { completedIds } = syncProcessingAcks(inDb, outDb);
-      if (completedIds.length > 0) {
-        await dispatchCompletionsForIds(inDb, completedIds, agentGroup.id);
+      const { pickedUpIds } = syncProcessingAcks(inDb, outDb);
+      if (pickedUpIds.length > 0) {
+        await dispatchCompletionsForIds(inDb, pickedUpIds, agentGroup.id);
       }
     }
 
@@ -237,7 +255,7 @@ async function sweepSession(session: Session): Promise<void> {
  * Cross-session order is already serialized by the outer sweep loop.
  */
 async function dispatchCompletionsForIds(inDb: Database.Database, ids: string[], agentGroupId: string): Promise<void> {
-  const stmt = inDb.prepare('SELECT channel_type, platform_id, thread_id FROM messages_in WHERE id = ?');
+  const stmt = inDb.prepare('SELECT channel_type, platform_id, thread_id, content FROM messages_in WHERE id = ?');
   for (const id of ids) {
     const row = stmt.get(id) as CompletedMessageRow | undefined;
     if (!row) continue;
@@ -248,6 +266,7 @@ async function dispatchCompletionsForIds(inDb: Database.Database, ids: string[],
         platformId: row.platform_id ?? '',
         threadId: row.thread_id,
         agentGroupId,
+        sender: parseSenderFromContent(row.content),
       });
     } catch (err) {
       // Belt-and-suspenders: dispatchCompletionHooks already isolates per-hook

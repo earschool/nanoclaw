@@ -169,47 +169,62 @@ export function getMessageForRetry(
 /**
  * Result of `syncProcessingAcks`.
  *
- * Buckets the IDs whose `messages_in.status` actually transitioned from
- * non-completed to completed in this call. Already-completed rows yield zero
- * row-changes from the UPDATE and are excluded from both buckets, which
- * gives the host-sweep an idempotent dispatch trigger — re-running the sweep
- * on the same DB state returns `{ completedIds: [], failedIds: [] }`.
+ * Buckets the IDs whose `messages_in.status` actually transitioned this call:
+ * - `pickedUpIds`: container just claimed the row (processing_ack='processing'
+ *   and messages_in.status was still pre-processing). Fires the read-receipt
+ *   hook so the sender sees the bot has read the message before the LLM call
+ *   roundtrip completes.
+ * - `completedIds` / `failedIds`: container finished the row.
  *
- * Used by the host-sweep to dispatch per-channel completion hooks
- * (Signal read receipts, etc.) without double-firing.
+ * Already-transitioned rows yield zero row-changes from their UPDATE and are
+ * excluded — re-running the sweep on the same DB state returns empty arrays.
  */
 export interface ProcessingAckSyncResult {
+  pickedUpIds: string[];
   completedIds: string[];
   failedIds: string[];
 }
 
 export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): ProcessingAckSyncResult {
   const acks = outDb
-    .prepare("SELECT message_id, status FROM processing_ack WHERE status IN ('completed', 'failed')")
-    .all() as Array<{ message_id: string; status: 'completed' | 'failed' }>;
+    .prepare("SELECT message_id, status FROM processing_ack WHERE status IN ('processing', 'completed', 'failed')")
+    .all() as Array<{ message_id: string; status: 'processing' | 'completed' | 'failed' }>;
 
-  if (acks.length === 0) return { completedIds: [], failedIds: [] };
+  if (acks.length === 0) return { pickedUpIds: [], completedIds: [], failedIds: [] };
 
+  const pickedUpIds: string[] = [];
   const completedIds: string[] = [];
   const failedIds: string[] = [];
 
-  // Primary effect (unchanged): mark every ack'd messages_in row as
-  // 'completed'. The WHERE clause guarantees idempotency — a row already in
-  // 'completed' yields zero changes, which we use to detect real transitions.
-  const updateStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status != 'completed'");
+  // Two idempotent UPDATEs per row, ordered earliest-state first:
+  // 1. pending → processing (fires read-receipt hook)
+  // 2. processing → completed/failed (terminal status sync)
+  // A row already past a given state yields zero changes for that stmt.
+  const toProcessing = inDb.prepare(
+    "UPDATE messages_in SET status = 'processing' WHERE id = ? AND status NOT IN ('processing', 'completed', 'failed')",
+  );
+  const toCompleted = inDb.prepare(
+    "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status != 'completed'",
+  );
+
   inDb.transaction(() => {
     for (const { message_id, status } of acks) {
-      const info = updateStmt.run(message_id);
-      if (info.changes === 0) continue;
-      if (status === 'completed') {
-        completedIds.push(message_id);
-      } else {
-        failedIds.push(message_id);
+      // Every ack we observe — regardless of its terminal/in-flight state —
+      // implies the container has at minimum picked the row up. Fire the
+      // pickup transition first; idempotent on rows we've already advanced.
+      if (toProcessing.run(message_id).changes > 0) {
+        pickedUpIds.push(message_id);
+      }
+      if (status === 'completed' || status === 'failed') {
+        if (toCompleted.run(message_id).changes > 0) {
+          if (status === 'completed') completedIds.push(message_id);
+          else failedIds.push(message_id);
+        }
       }
     }
   })();
 
-  return { completedIds, failedIds };
+  return { pickedUpIds, completedIds, failedIds };
 }
 
 export function getStuckProcessingIds(outDb: Database.Database): string[] {

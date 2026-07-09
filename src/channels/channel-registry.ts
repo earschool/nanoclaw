@@ -40,6 +40,14 @@ export type CompletionHook = (msg: {
   platformId: string;
   threadId: string | null;
   agentGroupId: string;
+  /**
+   * Original sender's channel-native handle, parsed from the inbound row's
+   * content JSON. For DMs this equals `platformId`; for group chats it's the
+   * individual sender (the group id lives in `platformId`). Null when
+   * messages_in.content can't be parsed or carries no `sender` field — e.g.
+   * a2a-internal rows or pre-migration data.
+   */
+  sender: string | null;
 }) => void | Promise<void>;
 
 const completionHooks = new Map<string, CompletionHook[]>();
@@ -68,7 +76,7 @@ export function registerCompletionHook(channelType: string, hook: CompletionHook
  */
 export async function dispatchCompletionHooks(
   channelType: string,
-  msg: { id: string; platformId: string; threadId: string | null; agentGroupId: string },
+  msg: { id: string; platformId: string; threadId: string | null; agentGroupId: string; sender: string | null },
 ): Promise<void> {
   const hooks = completionHooks.get(channelType);
   if (!hooks || hooks.length === 0) return;
